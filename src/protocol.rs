@@ -14,10 +14,14 @@ pub enum Command {
     Status,
     /// OBS の部品をダウンロードして使える状態にする（済んでいれば何もしない）
     Bootstrap,
-    /// 取り込みとリプレイバッファを始める
+    /// 取り込みを始める（ゲームのウィンドウを待つ。録画は record で始める）
     Start(StartSettings),
-    /// リプレイバッファの中身（直前 N 秒）をファイルに保存する
-    Save,
+    /// 録画を始める（path に書く）
+    Record { path: String },
+    /// 録画を止めて、ファイルを書き終える
+    RecordStop,
+    /// 録画を止めて、ファイルを消す
+    RecordCancel,
     /// 取り込みを止める
     Stop,
     /// 終了する
@@ -32,8 +36,6 @@ pub struct StartSettings {
     pub exe: String,
     /// 取り込みの方式: "game"（ゲームキャプチャ）/ "monitor"（画面全体。動作確認用）
     pub source: String,
-    /// 保持する秒数（直前 N 秒）
-    pub seconds: i64,
     /// 保存先フォルダ
     pub dir: String,
     /// 出力の解像度
@@ -53,7 +55,6 @@ impl Default for StartSettings {
         Self {
             exe: "armoredcore6.exe".into(),
             source: "game".into(),
-            seconds: 60,
             dir: ".".into(),
             width: 1920,
             height: 1080,
@@ -72,15 +73,23 @@ pub enum Event {
     /// 起動した
     Hello { version: &'static str },
     /// OBS の部品の状態
-    Status { installed: bool, capturing: bool },
+    Status {
+        installed: bool,
+        capturing: bool,
+        recording: bool,
+    },
     /// OBS の部品のダウンロードが済んだ（provisioned: 今回入れたなら true）
     Bootstrapped { provisioned: bool },
     /// ゲームのウィンドウを待っている
     WaitingForGame { exe: String },
     /// 取り込みを始めた（ゲームのウィンドウを見つけた）
     Capturing { window: String, encoder: String },
-    /// 保存した
-    Saved { path: String },
+    /// 録画を始めた
+    Recording { path: String },
+    /// 録画を止めた（ファイルを書き終えた）
+    Recorded { path: String },
+    /// 録画を捨てた
+    RecordCancelled,
     /// 止めた
     Stopped,
     /// 失敗（command: どの命令で起きたか）

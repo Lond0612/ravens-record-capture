@@ -1,4 +1,4 @@
-//! rrcap: ゲームの映像と音を取り込み、直前 N 秒をクリップとして保存するプログラム
+//! rrcap: ゲームの映像と音を取り込み、呼び出し側の合図（record / record_stop）で録画するプログラム
 //!
 //! 呼び出し側とは、標準入出力の JSON Lines でやり取りする（protocol.rs）。
 //! OBS の部品（obs.dll など）は、この exe と同じフォルダに置く。無ければ bootstrap の命令でダウンロードする。
@@ -76,6 +76,7 @@ fn main() {
                 Command::Status => emit(&Event::Status {
                     installed: installed(),
                     capturing: capture.as_ref().is_some_and(|c| c.is_started()),
+                    recording: capture.as_ref().is_some_and(|c| c.is_recording()),
                 }),
                 Command::Bootstrap => {
                     if capture.is_some() {
@@ -109,13 +110,28 @@ fn main() {
                         Err(e) => error("start", e),
                     }
                 }
-                Command::Save => match capture.as_ref() {
-                    Some(c) => match c.save() {
-                        Ok(path) => emit(&Event::Saved { path }),
-                        Err(e) => error("save", e),
+                Command::Record { path } => match capture.as_mut() {
+                    Some(c) => match c.record(&path) {
+                        Ok(()) => emit(&Event::Recording { path }),
+                        Err(e) => error("record", e),
                     },
-                    None => error("save", "まだ始めていません"),
+                    None => error("record", "まだ始めていません"),
                 },
+                Command::RecordStop => match capture.as_mut() {
+                    Some(c) => match c.finish() {
+                        Ok(path) => emit(&Event::Recorded { path }),
+                        Err(e) => error("record_stop", e),
+                    },
+                    None => error("record_stop", "まだ始めていません"),
+                },
+                Command::RecordCancel => {
+                    if let Some(c) = capture.as_mut()
+                        && let Err(e) = c.cancel()
+                    {
+                        error("record_cancel", e);
+                    }
+                    emit(&Event::RecordCancelled);
+                }
                 Command::Stop => {
                     if let Some(c) = capture.take()
                         && let Err(e) = c.stop()

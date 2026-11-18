@@ -1,18 +1,22 @@
-//! OBS（libobs）での取り込みとリプレイバッファ
+//! OBS（libobs）での取り込みと録画
 //!
 //! OBS の呼び出しは、すべて main のスレッドから行う（このモジュールの値は別のスレッドに渡さない）。
 //! ゲームキャプチャは、ゲームのウィンドウが出てから作る（それまでは WaitingForGame）。
+//! 録画の出力は 1 つを使い回す（録画のたびに保存先だけ変える）。止めると、ファイルを書き終えるまで待つ。
 
 use anyhow::{Context, Result, anyhow, bail};
-use libobs_simple::output::replay::ObsContextReplayExt;
-use libobs_simple::output::simple::{HardwareCodec, HardwarePreset, X264Preset};
+use libobs_simple::output::simple::{
+    HardwareCodec, HardwarePreset, ObsContextSimpleExt, X264Preset,
+};
 use libobs_simple::sources::ObsSourceBuilder;
 use libobs_simple::sources::windows::{
     GameCaptureSourceBuilder, MonitorCaptureSourceBuilder, ObsGameCaptureMode,
 };
 use libobs_window_helper::{WindowSearchMode, get_all_windows};
 use libobs_wrapper::context::ObsContext;
-use libobs_wrapper::data::output::{ObsOutputTrait, ObsReplayBufferOutputRef};
+use libobs_wrapper::data::ObsDataSetters;
+use libobs_wrapper::data::object::ObsObjectTrait;
+use libobs_wrapper::data::output::{ObsOutputRef, ObsOutputTrait};
 use libobs_wrapper::data::video::ObsVideoInfoBuilder;
 use libobs_wrapper::enums::ObsLogLevel;
 use libobs_wrapper::logger::ObsLogger;
@@ -26,13 +30,15 @@ pub struct Capture {
     settings: StartSettings,
     ctx: ObsContext,
     scene: ObsSceneRef,
-    replay: ObsReplayBufferOutputRef,
+    output: ObsOutputRef,
     /// ゲームキャプチャを作って取り込みを始めたか
     started: bool,
+    /// 録画中のファイル
+    recording: Option<PathBuf>,
 }
 
 impl Capture {
-    /// OBS を起動し、リプレイバッファを用意する（取り込みはまだ始めない）
+    /// OBS を起動し、録画の出力を用意する（取り込みはまだ始めない）
     pub fn new(settings: StartSettings) -> Result<Self> {
         let video = ObsVideoInfoBuilder::new()
             .base_width(settings.width)
@@ -60,34 +66,36 @@ impl Capture {
 
         std::fs::create_dir_all(&settings.dir)
             .with_context(|| format!("保存先を作れませんでした: {}", settings.dir))?;
+        let placeholder = Path::new(&settings.dir).join("rrcap_recording.mp4");
         let builder = ctx
-            .replay_buffer_builder("rrcap_replay", ObsPath::new(&settings.dir))
-            .max_time_sec(settings.seconds)
-            // 保持の上限（MB）: ビットレートから見積もった量の 2 倍。秒数で切れるより先に容量で切れないように
-            .max_size_mb(
-                ((settings.bitrate_kbps as i64 + 192) * settings.seconds / 8 / 1000 * 2).max(100),
+            .simple_output_builder(
+                "rrcap_recording",
+                ObsPath::new(&placeholder.display().to_string()),
             )
             .video_bitrate(settings.bitrate_kbps)
-            .audio_bitrate(160)
-            .format("%CCYY-%MM-%DD_%hh-%mm-%ss")
-            .allow_spaces(false);
+            .audio_bitrate(160);
         let builder = match settings.codec.as_str() {
-            "h264" => builder.hardware_encoder(HardwareCodec::H264, HardwarePreset::Balanced),
-            "hevc" => builder.hardware_encoder(HardwareCodec::HEVC, HardwarePreset::Balanced),
-            "av1" => builder.hardware_encoder(HardwareCodec::AV1, HardwarePreset::Balanced),
+            "h264" => {
+                builder.require_hardware_encoder(HardwareCodec::H264, HardwarePreset::Balanced)
+            }
+            "hevc" => {
+                builder.require_hardware_encoder(HardwareCodec::HEVC, HardwarePreset::Balanced)
+            }
+            "av1" => builder.require_hardware_encoder(HardwareCodec::AV1, HardwarePreset::Balanced),
             "x264" => builder.x264_encoder(X264Preset::VeryFast),
             other => bail!("知らない圧縮の方式です: {other}"),
         };
-        let replay = builder
+        let output = builder
             .build()
-            .context("リプレイバッファを用意できませんでした（GPU の圧縮が使えない可能性）")?;
+            .context("録画を用意できませんでした（GPU の圧縮が使えない可能性）")?;
         let scene = ctx.scene("rrcap_scene", Some(0))?;
         Ok(Self {
             settings,
             ctx,
             scene,
-            replay,
+            output,
             started: false,
+            recording: None,
         })
     }
 
@@ -140,31 +148,62 @@ impl Capture {
             }
             other => bail!("知らない取り込みの方式です: {other}"),
         };
-        self.replay
-            .start()
-            .context("リプレイバッファを始められませんでした")?;
         self.started = true;
         Ok(Some(label))
     }
 
-    /// 直前 N 秒を保存し、ファイルの場所を返す
-    pub fn save(&self) -> Result<String> {
+    /// 録画を始める（path に書く）。録画中なら、いまの録画を捨ててから始める
+    pub fn record(&mut self, path: &str) -> Result<()> {
         if !self.started {
             bail!("まだ取り込みを始めていません");
         }
-        let path = self.replay.save_buffer().context("保存できませんでした")?;
+        if self.recording.is_some() {
+            self.cancel()?;
+        }
+        let path = PathBuf::from(path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut data = self.ctx.data()?;
+        data.set_string("path", path.display().to_string())?;
+        self.output.update_settings(data)?;
+        self.output.start().context("録画を始められませんでした")?;
+        self.recording = Some(path);
+        Ok(())
+    }
+
+    /// 録画を止めて（ファイルを書き終えるまで待つ）、ファイルの場所を返す
+    pub fn finish(&mut self) -> Result<String> {
+        let path = self
+            .recording
+            .take()
+            .ok_or_else(|| anyhow!("録画していません"))?;
+        self.output.stop().context("録画を止められませんでした")?;
         Ok(path.display().to_string())
+    }
+
+    /// 録画を止めて、ファイルを消す
+    pub fn cancel(&mut self) -> Result<()> {
+        let Some(path) = self.recording.take() else {
+            return Ok(());
+        };
+        let stopped = self.output.stop();
+        let _ = std::fs::remove_file(&path); // 書きかけのファイル。消せなくても、次の録画は始められる
+        stopped.context("録画を止められませんでした")?;
+        Ok(())
+    }
+
+    pub fn is_recording(&self) -> bool {
+        self.recording.is_some()
     }
 
     pub fn encoder_name(&self) -> String {
         self.settings.codec.clone()
     }
 
-    pub fn stop(self) -> Result<()> {
-        if self.started {
-            self.replay.stop()?;
-        }
-        Ok(())
+    /// 終わる: 録画中なら、書きかけのファイルは消す（試合の途中で終わった録画は使わない）
+    pub fn stop(mut self) -> Result<()> {
+        self.cancel()
     }
 }
 
@@ -187,11 +226,12 @@ fn exe_dir() -> Result<PathBuf> {
         .to_path_buf())
 }
 
-/// 使う OBS のプラグイン。配信用（rtmp-services など。起動時にネットへ出る）や、使わない入力・フィルターは読み込まない
+/// 使う OBS のプラグイン。配信の宛先の取得（rtmp-services。起動時にネットへ出る）や、使わない入力・フィルターは読み込まない
 const PLUGINS: &[&str] = &[
     "win-capture.dll",
     "win-wasapi.dll",
     "obs-ffmpeg.dll",
+    "obs-outputs.dll", // Hybrid MP4（録画中に落ちても途中まで再生できる）の書き出し
     "obs-nvenc.dll",
     "obs-qsv11.dll",
     "obs-x264.dll",
