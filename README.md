@@ -1,6 +1,7 @@
 # ravens-record-capture (rrcap)
 
-ゲームの映像と音を [libobs](https://github.com/obsproject/obs-studio)（[libobs-rs](https://github.com/libobs-rs/libobs-rs)）で取り込み、呼び出し側の合図で録画するプログラムです（試作中）。
+ゲームの映像と音を [libobs](https://github.com/obsproject/obs-studio)（[libobs-rs](https://github.com/libobs-rs/libobs-rs)）で取り込み、呼び出し側の合図で録画するプログラムです。
+[RAVEN'S RECORD](https://ravens-record.com) のデスクトップアプリの「試合のクリップ」で使っています（RAVEN'S RECORD とは別のプロセスとして動き、標準入出力だけでやり取りします）。
 呼び出し側とは、標準入出力の JSON Lines（1 行 1 件の JSON）でやり取りします。
 
 ## 命令（標準入力）
