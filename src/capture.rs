@@ -10,7 +10,7 @@ use libobs_simple::output::simple::{
 };
 use libobs_simple::sources::ObsSourceBuilder;
 use libobs_simple::sources::windows::{
-    GameCaptureSourceBuilder, MonitorCaptureSourceBuilder, ObsGameCaptureMode,
+    GameCaptureSourceBuilder, MonitorCaptureSourceBuilder, ObsGameCaptureMode, ObsHookRate,
 };
 use libobs_window_helper::{WindowSearchMode, get_all_windows};
 use libobs_wrapper::context::ObsContext;
@@ -133,7 +133,9 @@ impl Capture {
                     .set_window(&window)
                     .set_capture_cursor(false)
                     .set_capture_overlays(false)
-                    .set_anti_cheat_hook(true); // アンチチートのあるゲーム向けの方式（OBS の既定と同じ）
+                    .set_anti_cheat_hook(true) // アンチチートのあるゲーム向けの方式（OBS の既定と同じ）
+                    // ゲームが描画の仕組みを作り直したとき（試合の開始・ロード）に、すぐつなぎ直す（遅いと、その間が真っ黒になる）
+                    .set_hook_rate(ObsHookRate::Fastest);
                 let builder = if self.settings.audio {
                     builder.set_capture_audio(true)?
                 } else {
