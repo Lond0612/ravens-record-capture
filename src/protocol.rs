@@ -82,8 +82,14 @@ pub enum Event {
     Bootstrapped { provisioned: bool },
     /// ゲームのウィンドウを待っている
     WaitingForGame { exe: String },
-    /// 取り込みを始めた（ゲームのウィンドウを見つけた）
-    Capturing { window: String, encoder: String },
+    /// 取り込みを始めた（ゲームのウィンドウを見つけた）。mode: "game"（ゲームキャプチャ）/ "window"（OBS などが動いているときのウィンドウキャプチャ）/ "monitor"
+    Capturing {
+        window: String,
+        encoder: String,
+        mode: String,
+    },
+    /// 取り込みの方式を差し替えた（OBS などが起動した・終わった）。録画は続いている
+    SourceChanged { mode: String },
     /// 録画を始めた
     Recording { path: String },
     /// 録画を止めた（ファイルを書き終えた）

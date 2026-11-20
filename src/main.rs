@@ -6,6 +6,7 @@
 #![allow(unknown_lints, ensure_obs_call_in_runtime)]
 
 mod capture;
+mod obs_detect;
 mod protocol;
 
 use libobs_bootstrapper::{ObsBootstrapper, ObsBootstrapperOptions, ObsBootstrapperResult};
@@ -144,6 +145,8 @@ fn main() {
             }
         }
 
+        sync_mode(&mut capture);
+
         // ゲームのウィンドウが出ていれば、取り込みを始める
         if let Some(c) = capture.as_mut()
             && !c.is_started()
@@ -152,6 +155,7 @@ fn main() {
                 Ok(Some(window)) => emit(&Event::Capturing {
                     window,
                     encoder: c.encoder_name(),
+                    mode: c.mode().into(),
                 }),
                 Ok(None) => {}
                 Err(e) => {
@@ -164,5 +168,16 @@ fn main() {
 
     if let Some(c) = capture.take() {
         let _ = c.stop();
+    }
+}
+
+/// OBS などの起動・終了に合わせて、取り込みの方式を差し替える（取り込み中だけ。POLL ごと）
+fn sync_mode(capture: &mut Option<capture::Capture>) {
+    if let Some(c) = capture.as_mut() {
+        match c.sync_mode() {
+            Ok(Some(mode)) => emit(&Event::SourceChanged { mode: mode.into() }),
+            Ok(None) => {}
+            Err(e) => error("source", e),
+        }
     }
 }

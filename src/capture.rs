@@ -3,6 +3,8 @@
 //! OBS の呼び出しは、すべて main のスレッドから行う（このモジュールの値は別のスレッドに渡さない）。
 //! ゲームキャプチャは、ゲームのウィンドウが出てから作る（それまでは WaitingForGame）。
 //! 録画の出力は 1 つを使い回す（録画のたびに保存先だけ変える）。止めると、ファイルを書き終えるまで待つ。
+//! OBS などが動いている間は、ゲームキャプチャの代わりにウィンドウキャプチャ（WGC）で録る（obs_detect.rs）。
+//! 録画の途中でも、取り込みの方式だけを差し替える（録画は続く）。
 
 use anyhow::{Context, Result, anyhow, bail};
 use libobs_simple::output::simple::{
@@ -11,6 +13,7 @@ use libobs_simple::output::simple::{
 use libobs_simple::sources::ObsSourceBuilder;
 use libobs_simple::sources::windows::{
     GameCaptureSourceBuilder, MonitorCaptureSourceBuilder, ObsGameCaptureMode, ObsHookRate,
+    ObsHookableSourceTrait, ObsWindowCaptureMethod, ObsWindowPriority, WindowCaptureSourceBuilder,
 };
 use libobs_window_helper::{WindowSearchMode, get_all_windows};
 use libobs_wrapper::context::ObsContext;
@@ -23,6 +26,14 @@ use libobs_wrapper::logger::ObsLogger;
 use libobs_wrapper::scenes::{ObsSceneRef, SceneItemTrait};
 use libobs_wrapper::utils::{ObsPath, StartupInfo, StartupPaths};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// ゲームキャプチャがこの秒数つながらなければ、ウィンドウキャプチャに切り替える
+/// （OBS が落ちたあとなど、ゲームの部品が前の相手のまま応えないことがある。2026-11-20 に OBS を強制終了したあとで起きた）
+const HOOK_TIMEOUT: Duration = Duration::from_secs(10);
+/// つながらずにウィンドウキャプチャにしたあと、録画していないときに、ゲームキャプチャを試し直すまでの秒数
+const HOOK_RETRY: Duration = Duration::from_secs(120);
 
 use crate::protocol::StartSettings;
 
@@ -33,6 +44,19 @@ pub struct Capture {
     output: ObsOutputRef,
     /// ゲームキャプチャを作って取り込みを始めたか
     started: bool,
+    /// いまの取り込み（"game" のときに、方式を差し替えるため）
+    item: Option<Arc<dyn SceneItemTrait>>,
+    /// いまの取り込みの方式: "game"（ゲームキャプチャ）/ "window"（ウィンドウキャプチャ）/ "monitor"
+    mode: &'static str,
+    /// 取り込みの部品の名前の通し番号（差し替えたとき、名前が重ならないように）
+    serial: u32,
+    /// ゲームキャプチャがつながったかを調べる（つながったという知らせが届いていれば true）
+    hook_check: Option<Box<dyn Fn() -> bool>>,
+    /// ゲームキャプチャを置いた時刻と、つながったか
+    game_added_at: Instant,
+    hooked: bool,
+    /// ゲームキャプチャがつながらなかったので、ウィンドウキャプチャにした時刻
+    hook_failed_at: Option<Instant>,
     /// 録画中のファイル
     recording: Option<PathBuf>,
 }
@@ -95,6 +119,13 @@ impl Capture {
             scene,
             output,
             started: false,
+            item: None,
+            mode: "",
+            serial: 0,
+            hook_check: None,
+            game_added_at: Instant::now(),
+            hooked: false,
+            hook_failed_at: None,
             recording: None,
         })
     }
@@ -120,29 +151,15 @@ impl Capture {
                     .set_monitor(monitor)
                     .add_to_scene(&mut self.scene)?;
                 item.fit_source_to_screen()?;
+                self.mode = "monitor";
                 "monitor".to_string()
             }
             "game" => {
                 let Some(window) = find_window(&self.settings.exe)? else {
                     return Ok(None);
                 };
-                let builder = self
-                    .ctx
-                    .source_builder::<GameCaptureSourceBuilder, _>("rrcap_game")?
-                    .set_capture_mode(ObsGameCaptureMode::CaptureSpecificWindow)
-                    .set_window(&window)
-                    .set_capture_cursor(false)
-                    .set_capture_overlays(false)
-                    .set_anti_cheat_hook(true) // アンチチートのあるゲーム向けの方式（OBS の既定と同じ）
-                    // ゲームが描画の仕組みを作り直したとき（試合の開始・ロード）に、すぐつなぎ直す（遅いと、その間が真っ黒になる）
-                    .set_hook_rate(ObsHookRate::Fastest);
-                let builder = if self.settings.audio {
-                    builder.set_capture_audio(true)?
-                } else {
-                    builder
-                };
-                let item = builder.add_to_scene(&mut self.scene)?;
-                item.fit_source_to_screen()?;
+                let mode = self.desired_mode();
+                self.add_game_source(mode, &window)?;
                 window
                     .title
                     .clone()
@@ -152,6 +169,117 @@ impl Capture {
         };
         self.started = true;
         Ok(Some(label))
+    }
+
+    /// ゲームを取り込む部品を作って、場面に置く（mode: "game" / "window"）
+    fn add_game_source(&mut self, mode: &'static str, window: &libobs_window_helper::WindowInfo) -> Result<()> {
+        self.serial += 1;
+        let item: Arc<dyn SceneItemTrait> = if mode == "window" {
+            // ゲームに何も入れない取り込み（OBS のゲームキャプチャと同時に使える）。最小化している間は映らない
+            let builder = self
+                .ctx
+                .source_builder::<WindowCaptureSourceBuilder, _>(format!("rrcap_window_{}", self.serial))?
+                .set_window(window)
+                .set_priority(ObsWindowPriority::Executable)
+                .set_capture_method(ObsWindowCaptureMethod::MethodWgc)
+                .set_cursor(false)
+                .set_client_area(true);
+            let builder = if self.settings.audio {
+                builder.set_capture_audio(true)?
+            } else {
+                builder
+            };
+            let item = builder.add_to_scene(&mut self.scene)?;
+            item.fit_source_to_screen()?;
+            Arc::new(item)
+        } else {
+            let builder = self
+                .ctx
+                .source_builder::<GameCaptureSourceBuilder, _>(format!("rrcap_game_{}", self.serial))?
+                .set_capture_mode(ObsGameCaptureMode::CaptureSpecificWindow)
+                .set_window(window)
+                .set_capture_cursor(false)
+                .set_capture_overlays(false)
+                .set_anti_cheat_hook(true) // アンチチートのあるゲーム向けの方式（OBS の既定と同じ）
+                // ゲームが描画の仕組みを作り直したとき（試合の開始・ロード）に、すぐつなぎ直す（遅いと、その間が真っ黒になる）
+                .set_hook_rate(ObsHookRate::Fastest);
+            let builder = if self.settings.audio {
+                builder.set_capture_audio(true)?
+            } else {
+                builder
+            };
+            let item = builder.add_to_scene(&mut self.scene)?;
+            item.fit_source_to_screen()?;
+            // つながったら届く知らせ（hooked）を受け取る
+            let rx = item.inner_source().source_specific_signals().on_hooked()?;
+            self.hook_check = Some(Box::new(move || rx.try_recv().is_ok()));
+            self.game_added_at = Instant::now();
+            self.hooked = false;
+            Arc::new(item)
+        };
+        if mode != "game" {
+            self.hook_check = None;
+        }
+        self.item = Some(item);
+        self.mode = mode;
+        Ok(())
+    }
+
+    /// OBS などが動いていれば、ウィンドウキャプチャ。ゲームキャプチャがつながらなかったあとも、しばらく（録画中はずっと）ウィンドウキャプチャ。
+    /// 録画中に OBS などが終わっても、その録画（試合）が終わるまではウィンドウキャプチャのまま（試合の途中で方式を変えない。
+    /// OBS が落ちたときは、ゲームキャプチャに戻すと、つながらずに黒くなることがあるため）
+    fn desired_mode(&self) -> &'static str {
+        if crate::obs_detect::obs_running() {
+            return "window";
+        }
+        if self.mode == "window" && self.recording.is_some() {
+            return "window";
+        }
+        match self.hook_failed_at {
+            Some(at) if self.recording.is_some() || at.elapsed() < HOOK_RETRY => "window",
+            _ => "game",
+        }
+    }
+
+    /// ゲームキャプチャがつながったかを確かめ、HOOK_TIMEOUT を過ぎてもつながらなければ、つながらなかったことにする
+    fn check_hook(&mut self) {
+        if self.mode != "game" || self.hooked {
+            return;
+        }
+        if self.hook_check.as_ref().is_some_and(|f| f()) {
+            self.hooked = true;
+            self.hook_failed_at = None;
+            return;
+        }
+        if self.game_added_at.elapsed() >= HOOK_TIMEOUT {
+            eprintln!("[rrcap] ゲームキャプチャが {} 秒つながらないため、ウィンドウキャプチャにします", HOOK_TIMEOUT.as_secs());
+            self.hook_failed_at = Some(Instant::now());
+        }
+    }
+
+    /// OBS などの起動・終了に合わせて、取り込みの方式を差し替える（録画は止めない）。差し替えたら新しい方式を返す
+    pub fn sync_mode(&mut self) -> Result<Option<&'static str>> {
+        if !self.started || self.settings.source != "game" {
+            return Ok(None);
+        }
+        self.check_hook();
+        let mode = self.desired_mode();
+        if mode == self.mode {
+            return Ok(None);
+        }
+        let Some(window) = find_window(&self.settings.exe)? else {
+            return Ok(None); // ゲームのウィンドウが無い（閉じた）: いまのままにする
+        };
+        // 先に今の取り込みを外す（ゲームキャプチャを外すと、ゲームの部品が OBS に映像を渡せるようになる）
+        if let Some(old) = self.item.take() {
+            self.scene.remove_item(old.as_ref())?;
+        }
+        self.add_game_source(mode, &window)?;
+        Ok(Some(mode))
+    }
+
+    pub fn mode(&self) -> &'static str {
+        self.mode
     }
 
     /// 録画を始める（path に書く）。録画中なら、いまの録画を捨ててから始める
