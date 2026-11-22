@@ -8,6 +8,7 @@
 mod capture;
 mod obs_detect;
 mod protocol;
+mod trim;
 
 use libobs_bootstrapper::{ObsBootstrapper, ObsBootstrapperOptions, ObsBootstrapperResult};
 use protocol::{Command, Event, emit};
@@ -30,6 +31,23 @@ fn error(command: &str, e: impl std::fmt::Display) {
 }
 
 fn main() {
+    // 切り落とすだけの起動: rrcap.exe --trim <元の MP4> <書き出す MP4> <秒>（OBS は起動しない）
+    // 結果は標準出力に 1 行の JSON（{"ok":true,"cut_sec":..} / {"ok":false,"message":".."}）
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--trim") {
+        let result = match (args.get(2), args.get(3), args.get(4).and_then(|s| s.parse::<f64>().ok())) {
+            (Some(input), Some(output), Some(sec)) => trim::trim(std::path::Path::new(input), std::path::Path::new(output), sec),
+            _ => Err(anyhow::anyhow!("使い方: rrcap.exe --trim <元の MP4> <書き出す MP4> <秒>")),
+        };
+        match result {
+            Ok(cut) => println!("{}", serde_json::json!({ "ok": true, "cut_sec": cut })),
+            Err(e) => {
+                println!("{}", serde_json::json!({ "ok": false, "message": format!("{e:#}") }));
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
         .target(env_logger::Target::Stderr)
         .init();

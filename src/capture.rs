@@ -112,6 +112,12 @@ impl Capture {
         let output = builder
             .build()
             .context("録画を用意できませんでした（GPU の圧縮が使えない可能性）")?;
+        // キーフレームを 1 秒ごとに打つ（試合のあとで前の部分を切り落とすとき、狙った場面の 1 秒以内から始められるように。trim.rs）
+        if let Some(encoder) = output.attached_video_encoder()? {
+            let mut data = ctx.data()?;
+            data.set_int("keyint_sec", 1)?;
+            encoder.update_settings(data)?;
+        }
         let scene = ctx.scene("rrcap_scene", Some(0))?;
         Ok(Self {
             settings,
